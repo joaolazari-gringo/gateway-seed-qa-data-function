@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "outDir": "./dist", // Diretório de saída dos arquivos compilados para JS
+    "rootDir": "./src",
+    "module": "commonjs", // Gera o JS usando o formato commonjs de import/export de módulos
+    "target": "es2019", // JS Gerado compatível com es2019 (Node 12)
+    "esModuleInterop": true, // Permite importar módulos escritos no formato com require
+    "resolveJsonModule": true, // Permite importar de arquivos JSON
+    "allowJs": true, 
+    "strict": true,
+  },
+  "exclude": [
+    "jest.config.js",
+    "newrelic.js"
+  ]
+}

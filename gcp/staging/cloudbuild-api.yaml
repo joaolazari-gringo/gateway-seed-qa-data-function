@@ -1,0 +1,276 @@
+steps:
+  - id: install
+    name: 'gcr.io/cloud-builders/npm:node-${_NODE_VERSION}'
+    dir: '${_DIR_NAME}'
+    entrypoint: npm
+    args: [ 'install' ]
+
+  - id: tests
+    name: 'gcr.io/cloud-builders/npm:node-${_NODE_VERSION}'
+    dir: '${_DIR_NAME}'
+    entrypoint: npm
+    args: [ 'test' ]
+
+  - id: tsc-compile
+    name: 'gcr.io/cloud-builders/npm:node-${_NODE_VERSION}'
+    dir: '${_DIR_NAME}'
+    entrypoint: npx
+    args: [ 'tsc' ]
+
+  - id: copy-required-files-to-dist
+    name: 'gcr.io/cloud-builders/gcloud'
+    dir: '${_DIR_NAME}'
+    entrypoint: /bin/sh
+    args:
+    - '-c'
+    - |
+      cp package.json ./dist
+      cp newrelic.js ./dist
+      cp .puppeteerrc.cjs ./dist
+      cp ./gcp/${_ENVIRONMENT}/.env.yaml ./dist
+    waitFor: [ 'tsc-compile' ]
+
+  - id: permission-management-credentials
+    dir: '${_DIR_NAME}'
+    name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: /bin/sh
+    timeout: '300s'
+    args:
+      - '-c'
+      - |
+        limited_function_name=$(echo "${_FUNCTION_NAME}" | head -c 25)
+        roleName=$(echo $${limited_function_name}-role)
+
+        saExists=$(gcloud iam service-accounts list --project=${PROJECT_ID} --filter="$roleName")
+        if [ -z "$saExists" ]
+        then
+              echo "Criando Role"
+              gcloud iam service-accounts create $roleName --display-name "$roleName" --project=${PROJECT_ID}
+        else
+              echo "Role já existe, pulando criação"
+        fi
+    waitFor: [ 'copy-required-files-to-dist' ]
+
+  - id: permission-management-roles-prepare
+    name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: /bin/sh
+    dir: '${_DIR_NAME}'
+    waitFor: [ 'permission-management-credentials']
+    timeout: '300s'
+    args:
+      - '-c'
+      - |
+        echo "Adicionando Papeis"
+
+        echo "Renomeia projeto"
+        sed 's/gringo-project/${PROJECT_ID}/' gcp/${_ENVIRONMENT}/roles.sh > tmp.txt && mv tmp.txt gcp/${_ENVIRONMENT}/roles.sh
+
+        # Unfiltered Roles
+        echo "Recursos sem filtro"
+        sed '/RECURSOS FILTRADOS IAM/q' gcp/${_ENVIRONMENT}/roles.sh | sed '/#/d' > unfiltered_roles_tmp.txt && awk 'NF' unfiltered_roles_tmp.txt > unfiltered_roles.txt && rm unfiltered_roles_tmp.txt
+
+        # Filtered Roles
+        echo "Recursos filtrados"
+        sed -n '/RECURSOS FILTRADOS IAM/,$p' gcp/${_ENVIRONMENT}/roles.sh | sed '/#/d' > filtered_roles_tmp.txt && awk 'NF' filtered_roles_tmp.txt > filtered_roles.txt && rm filtered_roles_tmp.txt
+
+        sed '/Funcoes em us-central1/q' gcp/${_ENVIRONMENT}/roles.sh | sed '/#/d' | grep function_ | cut -c 10-999 > resources_functions_sa.txt
+        echo "Functions SA:"
+        cat resources_functions_sa.txt
+
+        sed -n '/Funcoes em us-central1/,$p' gcp/${_ENVIRONMENT}/roles.sh | sed '/#/d' | grep function_ | cut -c 10-999 > resources_functions_us.txt
+        echo "Functions US:"
+        cat resources_functions_us.txt
+
+        cat filtered_roles.txt | grep secrets/ > resources_secrets.txt
+        cat filtered_roles.txt | grep buckets/ > resources_buckets.txt
+        cat filtered_roles.txt | grep roles/pubsub > roles_pubsub.txt
+        cat filtered_roles.txt | grep roles/gringo_pub_sub >> roles_pubsub.txt
+        cat filtered_roles.txt | grep roles/secretmanager > roles_secrets.txt
+        cat filtered_roles.txt | grep roles/storage > roles_buckets.txt
+        cat filtered_roles.txt | grep roles/gringo_cs_view_create >> roles_buckets.txt
+
+        echo "Fim"
+  
+  - id: permission-management-roles-apply-nom-filtered
+    name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: /bin/sh
+    dir: '${_DIR_NAME}'
+    waitFor: [ 'permission-management-roles-prepare']
+    timeout: '600s'
+    args:
+      - '-c'
+      - |
+        limited_function_name=$(echo "${_FUNCTION_NAME}" | head -c 25)
+        roleName=$(echo $${limited_function_name}-role)
+
+        echo "comando fullID: gcloud iam service-accounts list --project=${PROJECT_ID} --filter="email ~ ^$roleName" --format='value(email)'"
+        fullId=$(gcloud iam service-accounts list --project=${PROJECT_ID} --filter="email ~ ^$roleName" --format='value(email)')
+
+        ## Apply unfiltered roles
+        if grep -q roles "unfiltered_roles.txt"; then
+            paste -d@ unfiltered_roles.txt | while IFS="@" read -r f1
+            do
+              echo gcloud projects add-iam-policy-binding ${PROJECT_ID} --member=serviceAccount:$fullId --role=$f1 --condition=None
+              gcloud projects add-iam-policy-binding ${PROJECT_ID} --member=serviceAccount:$fullId --role=$f1 --condition=None > /dev/null
+            done
+        fi
+  
+  - id: permission-management-roles-apply-filtered-1
+    name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: /bin/sh
+    dir: '${_DIR_NAME}'
+    waitFor: [ 'permission-management-roles-apply-nom-filtered']
+    timeout: '600s'
+    args:
+      - '-c'
+      - |
+        limited_function_name=$(echo "${_FUNCTION_NAME}" | head -c 25)
+        roleName=$(echo $${limited_function_name}-role)
+
+        echo "comando fullID: gcloud iam service-accounts list --project=${PROJECT_ID} --filter="email ~ ^$roleName" --format='value(email)'"
+        fullId=$(gcloud iam service-accounts list --project=${PROJECT_ID} --filter="email ~ ^$roleName" --format='value(email)')
+
+        echo pubsub
+        if grep -q roles "roles_pubsub.txt"; then
+            paste -d@ roles_pubsub.txt | while IFS="@" read -r f1
+            do
+              gcloud projects add-iam-policy-binding ${PROJECT_ID} --member=serviceAccount:$fullId --role=$f1 --condition=None > /dev/null
+            done
+        fi
+
+        echo functions
+        if [ -s resources_functions_sa.txt ]
+          then
+            paste -d@ resources_functions_sa.txt | while IFS="@" read -r f1
+              do
+                gcloud functions add-iam-policy-binding $f1 --project ${PROJECT_ID} --region southamerica-east1 --member=serviceAccount:$fullId --role=$(cat roles_functions.txt) > /dev/null
+              done
+        else
+              echo "sa empty"
+        fi
+        if [ -s resources_functions_us.txt ]
+          then
+            paste -d@ resources_functions_us.txt | while IFS="@" read -r f1
+              do
+                gcloud functions add-iam-policy-binding $f1 --project ${PROJECT_ID} --region us-central1 --member=serviceAccount:$fullId --role=$(cat roles_functions.txt) > /dev/null
+              done
+        else
+              echo "us empty"
+        fi
+
+  - id: permission-management-roles-apply-filtered-2
+    name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: /bin/sh
+    dir: '${_DIR_NAME}'
+    waitFor: [ 'permission-management-roles-apply-filtered-1']
+    timeout: '600s'
+    args:
+      - '-c'
+      - |
+        limited_function_name=$(echo "${_FUNCTION_NAME}" | head -c 25)
+        roleName=$(echo $${limited_function_name}-role)
+
+        echo "comando fullID: gcloud iam service-accounts list --project=${PROJECT_ID} --filter="email ~ ^$roleName" --format='value(email)'"
+        fullId=$(gcloud iam service-accounts list --project=${PROJECT_ID} --filter="email ~ ^$roleName" --format='value(email)')
+
+        echo storage
+        if [ -s resources_buckets.txt ]
+          then
+            lines=$(wc -l resources_buckets.txt | awk '{print $1}' FS=[" "])
+            if [ $lines = "1" ]
+              then
+                echo -n "gcloud projects add-iam-policy-binding ${PROJECT_ID} --member=serviceAccount:$fullId --role=$(cat roles_buckets.txt | head -n 1) --condition='title=resource_filter,description=resource_filter,expression=resource.name.startsWith(\"$(cat resources_buckets.txt | head -n 1)\")" > buckets_command.txt
+              else
+                echo -n "gcloud projects add-iam-policy-binding ${PROJECT_ID} --member=serviceAccount:$fullId --role=$(cat roles_buckets.txt) --condition='title=resource_filter,description=resource_filter,expression=resource.name.startsWith(\"$(cat resources_buckets.txt | head -n 1)\")" > buckets_command.txt && tail -n +2 "resources_buckets.txt" > tmp.txt && mv tmp.txt resources_buckets.txt
+                paste -d@ resources_buckets.txt | while IFS="@" read -r f1
+                do
+                  echo -n " || resource.name.startsWith(\"$f1\")" >> buckets_command.txt
+                done
+            fi
+            echo -n "'" >> buckets_command.txt && cat buckets_command.txt && bash buckets_command.txt > /dev/null
+        else
+              echo "buckets empty"
+        fi
+
+  - id: deploy
+    dir: '${_DIR_NAME}/dist'
+    entrypoint: /bin/sh
+    waitFor: [ 'permission-management-roles-apply-filtered-2' ]
+    name: 'gcr.io/cloud-builders/gcloud'
+    args:
+      - '-c'
+      - |
+        limited_function_name=$(echo "${_FUNCTION_NAME}" | head -c 25)
+        roleName=$(echo $${limited_function_name}-role)
+
+        echo "comando fullID: gcloud iam service-accounts list --project=${PROJECT_ID} --filter="email ~ ^$roleName" --format='value(email)'"
+        fullId=$(gcloud iam service-accounts list --project=${PROJECT_ID} --filter="email ~ ^$roleName" --format='value(email)')
+
+        gcloud beta functions deploy ${_FUNCTION_NAME} \
+          --region=${_REGION} \
+          --memory=1024MB \
+          --timeout=300s \
+          --max-instances=20 \
+          --service-account=$${fullId} \
+          --vpc-connector=${_ENVIRONMENT}-vpc-con \
+          --ingress-settings=internal-and-gclb \
+          --entry-point=${_ENTRY_POINT} \
+          --runtime=nodejs18 \
+          --trigger-http \
+          --update-labels=environment=${_ENVIRONMENT},chapter=api,function-type=scraping,function-name=${_FUNCTION_NAME} \
+          --set-secrets=NEW_RELIC_LICENSE_KEY=newrelic-license-key-secret:latest \
+          --set-secrets=SCRAPING_FUNCTIONS_API_KEY=scraping-functions-api-key-secret:latest \
+          --set-secrets=ZYTE_PROXY_CERTIFICATE=zyte-proxy-certificate-secret:latest \
+          --set-secrets=ZYTE_API_KEY=zyte-api-key-secret:latest \
+          --env-vars-file=.env.yaml
+
+  - id: update-backend-service
+    name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: /bin/sh
+    timeout: '600s'
+    args:
+      - '-c'
+      - |
+        negExists=$(gcloud compute network-endpoint-groups list --project=${PROJECT_ID} --filter="neg-${_FUNCTION_NAME}")
+        if [ -z "$negExists" ]
+        then
+          gcloud compute network-endpoint-groups create neg-${_FUNCTION_NAME} --project=${PROJECT_ID} --region=${_REGION} --network-endpoint-type=serverless --cloud-function-name=${_FUNCTION_NAME}
+        else
+              echo "Neg já existe, pulando criação"
+        fi  
+        backendExists=$(gcloud compute backend-services list --project=${PROJECT_ID} --filter="service-${_FUNCTION_NAME}")
+        if [ -z "$backendExists" ]
+        then
+          gcloud compute backend-services create service-${_FUNCTION_NAME} --project=${PROJECT_ID} --load-balancing-scheme=EXTERNAL --global
+          gcloud compute backend-services add-backend service-${_FUNCTION_NAME} --project=${PROJECT_ID} --global --network-endpoint-group=neg-${_FUNCTION_NAME} --network-endpoint-group-region=${_REGION}
+          gcloud compute backend-services update service-${_FUNCTION_NAME} --project=${PROJECT_ID} --security-policy=gringo-${_ENVIRONMENT}-backend-policy --global
+        else
+              echo "Backend service já existe, pulando criação"
+        fi
+    waitFor: [ 'deploy' ]
+
+  - id: Atualiza path matcher
+    name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: /bin/sh
+    timeout: '600s'
+    args:
+      - '-c'
+      - |
+        mapExists=$(gcloud compute url-maps describe ${_ENVIRONMENT}-external-alb --project=${PROJECT_ID} | grep ${_FUNCTION_NAME})
+        if [ -z "$mapExists" ]
+        then
+              echo "Criando Map"
+              gcloud compute url-maps add-path-matcher ${_ENVIRONMENT}-external-alb --project=${PROJECT_ID} --new-hosts=${_FUNCTION_NAME}-${_ENVIRONMENT}.gringo.com.vc --default-service=service-${_FUNCTION_NAME} --path-matcher-name=${_FUNCTION_NAME}-${_ENVIRONMENT} --delete-orphaned-path-matcher 
+        else
+              echo "Map já existe, pulando criação"
+        fi 
+    waitFor: [ 'update-backend-service' ]
+  
+substitutions:
+  _ENVIRONMENT: staging
+  _DIR_NAME: /
+  _FUNCTION_NAME: gateway-seed-qa-data-function
+  _REGION: southamerica-east1
+  _ENTRY_POINT: api
+  _NOTIFY_SLACK: '1'
+  _NODE_VERSION: '18.12.0'
